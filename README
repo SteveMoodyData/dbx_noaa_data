@@ -1,0 +1,59 @@
+# NOAA Weather Data Pipeline
+
+A Lakeflow declarative pipeline that processes NOAA weather observations through a medallion architecture.
+
+## Architecture
+
+```
+Delta Share (NOAA GHCN Daily)
+    ↓
+Bronze: noaa_data.bronze.bronze_noaa_ghcn_daily_raw
+    Raw data + audit columns
+    ↓
+Silver: noaa_data.silver.silver_daily_observations
+    Unit conversions (tenths °C → °C)
+    Data quality filtering
+    ↓
+Gold: 
+    ├─ noaa_data.gold.gold_monthly_weather_summary
+    │  Monthly aggregations by station
+    └─ noaa_data.gold.gold_recent_weather_dashboard
+       Last 30 days for dashboards
+```
+
+## What It Does
+
+**Bronze Layer**
+- Reads from Delta Share: `rearc_daily_weather_observations_noaa.esg_noaa_ghcn.noaa_ghcn_daily`
+- Adds ingestion timestamp
+- No transformations
+
+**Silver Layer**
+- Converts temperatures from tenths of °C to Celsius
+- Converts precipitation/snowfall to standard units
+- Filters invalid data (bad temp ranges, future dates)
+- Drops rows where temp_max < temp_min
+- Calculates data quality score
+
+**Gold Layer**
+- Monthly summaries: avg/min/max temps, total precipitation, completeness metrics
+- Recent dashboard: last 30 days with both Celsius and Fahrenheit
+
+## Setup
+
+1. Create schemas:
+```sql
+CREATE SCHEMA IF NOT EXISTS noaa_data.bronze;
+CREATE SCHEMA IF NOT EXISTS noaa_data.silver;
+CREATE SCHEMA IF NOT EXISTS noaa_data.gold;
+```
+
+2. Create Lakeflow pipeline pointing to `lakeflow_noaa_pipeline.sql`
+
+3. Run pipeline in development mode
+
+## Notes
+
+- Pipeline runs in batch mode (not streaming) because Delta Share doesn't support time travel
+- Full refresh on each run
+- ~867M records from 100K weather stations (1900-2024)
