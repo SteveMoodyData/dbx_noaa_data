@@ -1,59 +1,232 @@
-# NOAA Weather Data Pipeline
+# NOAA Weather + EIA Energy Data Pipeline
 
-A Lakeflow declarative pipeline that processes NOAA weather observations through a medallion architecture.
+A Lakeflow declarative pipeline combining NOAA weather observations with EIA electricity demand data to analyze weather-energy correlations through a medallion architecture.
 
 ## Architecture
 
 ```
-Delta Share (NOAA GHCN Daily)
+Data Sources:
+├─ Delta Share: NOAA GHCN Daily Weather
+└─ EIA API: Electricity Demand by Region
     ↓
-Bronze: noaa_data.bronze.bronze_noaa_ghcn_daily_raw
-    Raw data + audit columns
+Bronze Layer:
+├─ noaa_data.bronze.bronze_noaa_ghcn_daily_raw (weather)
+└─ noaa_data.bronze.eia_electricity_demand_raw (energy)
     ↓
-Silver: noaa_data.silver.silver_daily_observations
-    Unit conversions (tenths °C → °C)
-    Data quality filtering
+Silver Layer:
+├─ noaa_data.silver.silver_daily_observations (clean weather)
+└─ noaa_data.silver.silver_electricity_demand (clean energy)
     ↓
-Gold: 
-    ├─ noaa_data.gold.gold_monthly_weather_summary
-    │  Monthly aggregations by station
-    └─ noaa_data.gold.gold_recent_weather_dashboard
-       Last 30 days for dashboards
+Gold Layer:
+├─ Weather Only:
+│  ├─ gold_monthly_weather_summary
+│  └─ gold_recent_weather_dashboard
+├─ Energy Only:
+│  └─ gold_monthly_energy_demand
+└─ Combined Analysis:
+   ├─ gold_regional_daily_weather (weather by energy region)
+   └─ gold_weather_energy_correlation (joined weather + demand)
 ```
 
 ## What It Does
 
-**Bronze Layer**
-- Reads from Delta Share: `rearc_daily_weather_observations_noaa.esg_noaa_ghcn.noaa_ghcn_daily`
-- Adds ingestion timestamp
-- No transformations
+**Weather Pipeline (Bronze → Silver → Gold)**
+- Ingests NOAA weather from Delta Share (~867M records, 100K stations)
+- Converts units (tenths °C → °C)
+- Filters invalid data
+- Aggregates by month and region
 
-**Silver Layer**
-- Converts temperatures from tenths of °C to Celsius
-- Converts precipitation/snowfall to standard units
-- Filters invalid data (bad temp ranges, future dates)
-- Drops rows where temp_max < temp_min
-- Calculates data quality score
+**Energy Pipeline (Bronze → Silver → Gold)**
+- Fetches EIA electricity demand via API (10 US regions)
+- Validates demand values
+- Aggregates by month and region
 
-**Gold Layer**
-- Monthly summaries: avg/min/max temps, total precipitation, completeness metrics
-- Recent dashboard: last 30 days with both Celsius and Fahrenheit
+**Combined Analysis**
+- Maps weather stations to energy regions by lat/lon
+- Calculates heating/cooling degree days (base 18°C)
+- Joins daily weather with daily demand
+- Enables correlation analysis
 
 ## Setup
 
-1. Create schemas:
+### Prerequisites
+1. Databricks workspace with Unity Catalog
+2. Access to Delta Share: `rearc_daily_weather_observations_noaa`
+3. Free EIA API key: https://www.eia.gov/opendata/register.php
+
+### Step 1: Create Schemas
 ```sql
 CREATE SCHEMA IF NOT EXISTS noaa_data.bronze;
 CREATE SCHEMA IF NOT EXISTS noaa_data.silver;
 CREATE SCHEMA IF NOT EXISTS noaa_data.gold;
 ```
 
-2. Create Lakeflow pipeline pointing to `lakeflow_noaa_pipeline.sql`
+### Step 2: Ingest EIA Energy Data
+1. Upload `eia_bronze_ingestion.py` as a notebook
+2. Add your EIA API key (line 19)
+3. Run the notebook
+4. Verify: `SELECT * FROM noaa_data.bronze.eia_electricity_demand_raw LIMIT 10;`
 
-3. Run pipeline in development mode
+### Step 3: Create Lakeflow Pipeline
+1. Go to Workflows → Delta Live Tables
+2. Create new pipeline
+3. Upload `lakeflow_weather_energy_pipeline.sql`
+4. Set target catalog: `noaa_data`
+5. Run in development mode
+
+### Step 4: Analyze
+Run queries from `weather_energy_analysis_queries.sql` to explore correlations
+
+## Key Gold Tables
+
+### `gold_weather_energy_correlation`
+**The main analytical table** - daily weather and demand joined by region
+
+**Columns:**
+- `date`, `region` - Primary keys
+- `avg_temp_c`, `min_temp_c`, `max_temp_c` - Temperature stats
+- `heating_degree_days`, `cooling_degree_days` - Energy metrics
+- `demand_mwh` - Electricity demand
+- `demand_per_hdd`, `demand_per_cdd` - Efficiency metrics
+
+**Sample Query:**
+```sql
+-- Temperature-demand correlation by region
+SELECT 
+    region,
+    CORR(avg_temp_c, demand_mwh) as correlation,
+    AVG(demand_mwh) as avg_demand
+FROM noaa_data.gold.gold_weather_energy_correlation
+WHERE date >= '2023-01-01'
+GROUP BY region
+ORDER BY correlation DESC;
+```
+
+### `gold_regional_daily_weather`
+Daily weather aggregated by energy region (PJM, CISO, ERCOT, etc.)
+
+**Region Mapping:**
+- PJM: Mid-Atlantic (PA, NJ, MD, etc.)
+- CISO: California
+- ERCO: Texas (ERCOT)
+- MISO: Midwest
+- NYIS: New York
+- ISNE: New England
+- And 4 more regions
+
+## Use Cases
+
+**Energy Demand Forecasting**
+- Predict demand based on temperature forecasts
+- Calculate impact of extreme weather events
+- Optimize generation capacity planning
+
+**Climate Impact Analysis**
+- Heating vs cooling dominant regions
+- Year-over-year temperature and demand trends
+- Seasonal pattern identification
+
+**Efficiency Analysis**
+- Demand per degree day by region
+- Compare regional weather sensitivity
+- Identify optimization opportunities
+
+## Sample Analyses
+
+### Peak Demand Days
+```sql
+SELECT 
+    region,
+    date,
+    avg_temp_f,
+    demand_mwh,
+    CASE 
+        WHEN avg_temp_f < 32 THEN 'Extreme Cold'
+        WHEN avg_temp_f > 90 THEN 'Extreme Heat'
+        ELSE 'Moderate'
+    END as condition
+FROM noaa_data.gold.gold_weather_energy_correlation
+ORDER BY demand_mwh DESC
+LIMIT 20;
+```
+
+### Heating vs Cooling Regions
+```sql
+SELECT 
+    region,
+    SUM(heating_degree_days) as annual_hdd,
+    SUM(cooling_degree_days) as annual_cdd,
+    ROUND(SUM(heating_degree_days) / 
+          (SUM(heating_degree_days) + SUM(cooling_degree_days)) * 100, 1) 
+          as pct_heating
+FROM noaa_data.gold.gold_weather_energy_correlation
+WHERE YEAR(date) = 2023
+GROUP BY region
+ORDER BY pct_heating DESC;
+```
+
+### ML Feature Engineering
+```sql
+SELECT 
+    date,
+    region,
+    avg_temp_c,
+    heating_degree_days,
+    cooling_degree_days,
+    demand_mwh as target,
+    LAG(demand_mwh, 1) OVER (PARTITION BY region ORDER BY date) as demand_lag1,
+    AVG(demand_mwh) OVER (PARTITION BY region ORDER BY date 
+                          ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING) as demand_avg_7d,
+    DAYOFWEEK(date) as day_of_week,
+    MONTH(date) as month
+FROM noaa_data.gold.gold_weather_energy_correlation
+WHERE date >= '2023-01-01';
+```
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `eia_bronze_ingestion.py` | Fetch EIA data via API, write to bronze |
+| `lakeflow_weather_energy_pipeline.sql` | Complete Lakeflow pipeline definition |
+| `weather_energy_analysis_queries.sql` | 10 sample analysis queries |
+| `README.md` | This file |
+
+## Data Details
+
+**Weather Data:**
+- Source: NOAA GHCN Daily via Delta Share
+- Records: 867M observations
+- Stations: 100K worldwide
+- Date Range: 1900-2024 (filtered in pipeline)
+
+**Energy Data:**
+- Source: EIA Open Data API
+- Regions: 10 major US electricity markets
+- Granularity: Daily demand (MWh)
+- Date Range: 2020-present (configurable in ingestion script)
 
 ## Notes
 
-- Pipeline runs in batch mode (not streaming) because Delta Share doesn't support time travel
-- Full refresh on each run
-- ~867M records from 100K weather stations (1900-2024)
+- Pipeline runs in batch mode (Delta Share doesn't support streaming)
+- Weather stations mapped to energy regions by approximate lat/lon boundaries
+- Degree day calculation uses 18°C (65°F) base temperature
+- Join requires at least 5 weather stations per region for data quality
+
+## Troubleshooting
+
+**Issue:** EIA bronze table not found  
+**Solution:** Run `eia_bronze_ingestion.py` first before the pipeline
+
+**Issue:** No data in correlation table  
+**Solution:** Check date ranges match between weather (1900+) and energy (2020+)
+
+**Issue:** Missing region mappings  
+**Solution:** Adjust lat/lon boundaries in `gold_regional_daily_weather` CTE
+
+## Next Steps
+
+- Build demand forecasting ML model
+- Add real-time weather forecasts for prediction
+- Include natural gas prices for additional analysis
+- Add regional population/economic data for per-capita metrics
